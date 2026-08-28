@@ -93,71 +93,244 @@ function parseRates(rawText) {
 
   /*
    * USD
+   *
+   * OCR у нас сейчас читает:
+   *
+   * a AoE ыы 150 = 90.00
+   *
+   * Поэтому ищем не только USD,
+   * но и характерную конструкцию:
+   *
+   * число = 90.00
    */
-  const usd = find(text, [
+
+  let usd = find(text, [
     /1\s*USD\s*=?\s*([\d.,]+)/i,
-    /USD[\s:=\-]+([\d.,]+)/i
+    /USD[\s:=\-]+([\d.,]+)/i,
+    /SWIFT[\s\S]{0,150}?=\s*([\d.,]+)/i
   ]);
 
   /*
-   * JPY:
-   * 100 JPY = 56.90
+   * В твоей картинке SWIFT USD = 90.00.
    *
-   * Для калькулятора:
-   * 1 JPY = 0.569
+   * Если OCR совсем испортил USD,
+   * берём число после SWIFT.
    */
-  const jpy = find(text, [
+
+  if (!usd) {
+    const swiftMatch = text.match(
+      /SWIFT[\s\S]{0,150}?(\d{2,3}[.,]\d{2})/i
+    );
+
+    if (swiftMatch) {
+      usd = number(swiftMatch[1]);
+    }
+  }
+
+  /*
+   * JPY
+   *
+   * 100 JPY = 56.90
+   */
+
+  let jpy = find(text, [
     /100\s*JPY\s*=?\s*([\d.,]+)/i,
     /JPY[\s:=\-]+([\d.,]+)/i
   ]);
 
   /*
-   * KRW:
+   * Если JPY написан нормально —
+   * это наш основной курс.
+   */
+
+  if (!jpy) {
+    const jpyMatch = text.match(
+      /100\s*J[PJYI]\s*=?\s*([\d.,]+)/i
+    );
+
+    if (jpyMatch) {
+      jpy = number(jpyMatch[1]);
+    }
+  }
+
+  /*
+   * KRW
+   *
    * 1000 KRW = 65.10
    */
-  const krw = find(text, [
+
+  let krw = find(text, [
     /1000\s*KRW\s*=?\s*([\d.,]+)/i,
     /KRW[\s:=\-]+([\d.,]+)/i
   ]);
 
   /*
-   * CNY
+   * Иногда OCR путает KRW.
+   * Но 1000 + число курса встречается
+   * очень характерно.
    */
-  const cny = find(text, [
+
+  if (!krw) {
+    const krwMatch = text.match(
+      /1000\s*[KК][RЯ][WШ]\s*=?\s*([\d.,]+)/i
+    );
+
+    if (krwMatch) {
+      krw = number(krwMatch[1]);
+    }
+  }
+
+  /*
+   * CNY
+   *
+   * OCR может вообще потерять CNY.
+   *
+   * На картинке рядом есть:
+   *
+   * КИТАЙ
+   *
+   * Поэтому сначала ищем CNY/RMB,
+   * затем КИТАЙ и ближайшее число.
+   */
+
+  let cny = find(text, [
     /1\s*CNY\s*=?\s*([\d.,]+)/i,
     /CNY[\s:=\-]+([\d.,]+)/i,
     /RMB[\s:=\-]+([\d.,]+)/i
   ]);
 
+  if (!cny) {
+    const chinaMatch = text.match(
+      /КИТАЙ[\s\S]{0,150}?(\d{1,3}[.,]\d{2})/i
+    );
+
+    if (chinaMatch) {
+      cny = number(chinaMatch[1]);
+    }
+  }
+
   /*
    * AED
+   *
+   * OCR в нашем случае:
+   *
+   * 1АЕр = 23.60
+   *
+   * Поэтому разрешаем:
+   *
+   * AED
+   * AЕD
+   * АЕр
+   * AEP
+   * и другие близкие варианты.
    */
-  const aed = find(text, [
+
+  let aed = find(text, [
     /1\s*AED\s*=?\s*([\d.,]+)/i,
-    /AED[\s:=\-]+([\d.,]+)/i
+    /AED[\s:=\-]+([\d.,]+)/i,
+    /АЕ[DPР]\s*=?\s*([\d.,]+)/i,
+    /AЕ[DPР]\s*=?\s*([\d.,]+)/i
   ]);
+
+  /*
+   * Самый надёжный вариант для этой картинки:
+   *
+   * АЕр = 23.60
+   */
+
+  if (!aed) {
+    const aedMatch = text.match(
+      /АЕ[DPР]\s*=?\s*(\d{1,3}[.,]\d{2})/i
+    );
+
+    if (aedMatch) {
+      aed = number(aedMatch[1]);
+    }
+  }
 
   /*
    * THB
    */
-  const thb = find(text, [
+
+  let thb = find(text, [
     /1\s*THB\s*=?\s*([\d.,]+)/i,
     /THB[\s:=\-]+([\d.,]+)/i
   ]);
 
-  const rates = {
-    JPY_INTERNAL: jpy ? jpy / 100 : 0,
-    JPY_SWIFT: jpy ? jpy / 100 : 0,
-    JPY_CASH: jpy ? jpy / 100 : 0,
-    JPY_QR: jpy ? jpy / 100 : 0,
+  /*
+   * OCR иногда превращает THB
+   * в похожие символы.
+   */
 
-    KRW: krw ? krw / 1000 : 0,
+  if (!thb) {
+    const thbMatch = text.match(
+      /1\s*T[HН][BВ8]\s*=?\s*([\d.,]+)/i
+    );
 
+    if (thbMatch) {
+      thb = number(thbMatch[1]);
+    }
+  }
+
+  /*
+   * Выводим найденные значения в лог.
+   */
+
+  console.log("PARSED RATES:");
+  console.log({
+    USD: usd,
+    JPY: jpy,
+    KRW: krw,
     CNY: cny,
     AED: aed,
+    THB: thb
+  });
+
+  /*
+   * Для JPY:
+   *
+   * 100 JPY = 56.90
+   *
+   * значит:
+   *
+   * 1 JPY = 0.569
+   */
+
+  const rates = {
+    JPY_INTERNAL: jpy
+      ? jpy / 100
+      : 0,
+
+    JPY_SWIFT: jpy
+      ? jpy / 100
+      : 0,
+
+    JPY_CASH: jpy
+      ? jpy / 100
+      : 0,
+
+    JPY_QR: jpy
+      ? jpy / 100
+      : 0,
+
+    /*
+     * 1000 KRW = 65.10
+     *
+     * 1 KRW = 0.0651
+     */
+
+    KRW: krw
+      ? krw / 1000
+      : 0,
+
+    CNY: cny,
+
+    AED: aed,
+
     THB: thb,
 
     USD_SWIFT: usd,
+
     USD_IDUBID: usd
   };
 
