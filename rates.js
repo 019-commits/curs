@@ -1,155 +1,753 @@
-const { getLatestImage } = require('./telegram');
+const {
+  getLatestImage
+} = require("./telegram");
 
-const OCR_ENDPOINT = 'https://api.ocr.space/parse/imageurl';
+const {
+  createWorker
+} = require("tesseract.js");
+
+
+/*
+=========================================================
+  НАСТРОЙКИ
+=========================================================
+*/
+
+const CACHE_TIME =
+  5 * 60 * 1000;
+
+
+/*
+=========================================================
+  ПАМЯТЬ ПОСЛЕДНИХ КУРСОВ
+=========================================================
+
+  Это очень важно.
+
+  Если Telegram временно недоступен
+  или OCR не смог прочитать картинку,
+  сайт не ломается.
+
+  Используются последние успешные курсы.
+*/
+
+let cache = {
+  postId: null,
+  imageUrl: null,
+  postUrl: null,
+  rates: null,
+  rawText: null,
+  updatedAt: null,
+  expiresAt: 0
+};
+
+
+/*
+=========================================================
+  ЧИСЛО
+=========================================================
+*/
 
 function number(value) {
-  if (value == null) return 0;
-  const normalized = String(value).replace(',', '.').replace(/[^0-9.]/g, '');
-  const n = Number(normalized);
-  return Number.isFinite(n) ? n : 0;
+
+  if (
+    value === null ||
+    value === undefined
+  ) {
+    return 0;
+  }
+
+  const normalized =
+    String(value)
+      .replace(",", ".")
+      .replace(/[^0-9.]/g, "");
+
+  const result =
+    Number(normalized);
+
+  return Number.isFinite(result)
+    ? result
+    : 0;
 }
 
+
+/*
+=========================================================
+  ПОИСК ЧИСЛА
+=========================================================
+*/
+
 function firstMatch(text, patterns) {
+
   for (const pattern of patterns) {
-    const match = text.match(pattern);
-    if (match) return number(match[1]);
+
+    const match =
+      text.match(pattern);
+
+    if (match) {
+      return number(match[1]);
+    }
   }
+
   return 0;
 }
 
-function parseRates(rawText) {
-  // OCR can produce Cyrillic/Latin variations and arbitrary line breaks.
-  const text = String(rawText || '')
-    .replace(/\u00a0/g, ' ')
-    .replace(/[|]/g, 'I')
-    .replace(/O(?=\d)/g, '0')
-    .replace(/(?<=\d)O/g, '0')
-    .replace(/\s+/g, ' ')
+
+/*
+=========================================================
+  НОРМАЛИЗАЦИЯ OCR
+=========================================================
+*/
+
+function normalizeText(rawText) {
+
+  return String(rawText || "")
+    .replace(/\u00a0/g, " ")
+
+    /*
+      OCR иногда путает:
+      O → 0
+      I → 1
+    */
+
+    .replace(/O(?=\d)/gi, "0")
+    .replace(/(?<=\d)O/gi, "0")
+
+    /*
+      Разные варианты тире.
+    */
+
+    .replace(/[–—−]/g, "-")
+
+    /*
+      Убираем лишние пробелы.
+    */
+
+    .replace(/\s+/g, " ")
+
     .trim();
+}
+
+
+/*
+=========================================================
+  РАСПОЗНАВАНИЕ КУРСОВ
+=========================================================
+*/
+
+function parseRates(rawText) {
+
+  const text =
+    normalizeText(rawText);
+
+
+  /*
+  -------------------------------------------------------
+    JPY
+  -------------------------------------------------------
+  */
+
+  const jpy =
+    firstMatch(text, [
+
+      /100\s*JPY\s*=\s*([0-9]+(?:[.,][0-9]+)?)/i,
+
+      /JPY[^0-9]{0,40}=\s*([0-9]+(?:[.,][0-9]+)?)/i
+    ]);
+
+
+  /*
+  -------------------------------------------------------
+    KRW
+  -------------------------------------------------------
+  */
+
+  const krw =
+    firstMatch(text, [
+
+      /1000\s*KRW\s*=\s*([0-9]+(?:[.,][0-9]+)?)/i,
+
+      /KRW[^0-9]{0,40}=\s*([0-9]+(?:[.,][0-9]+)?)/i
+    ]);
+
+
+  /*
+  -------------------------------------------------------
+    CNY
+  -------------------------------------------------------
+  */
+
+  const cny =
+    firstMatch(text, [
+
+      /1\s*(?:CNY|RMB)\s*=\s*([0-9]+(?:[.,][0-9]+)?)/i,
+
+      /(?:CNY|RMB)[^0-9]{0,40}=\s*([0-9]+(?:[.,][0-9]+)?)/i
+    ]);
+
+
+  /*
+  -------------------------------------------------------
+    AED
+  -------------------------------------------------------
+  */
+
+  const aed =
+    firstMatch(text, [
+
+      /1\s*AED\s*=\s*([0-9]+(?:[.,][0-9]+)?)/i,
+
+      /AED[^0-9]{0,40}=\s*([0-9]+(?:[.,][0-9]+)?)/i
+    ]);
+
+
+  /*
+  -------------------------------------------------------
+    THB
+  -------------------------------------------------------
+  */
+
+  const thb =
+    firstMatch(text, [
+
+      /1\s*THB\s*=\s*([0-9]+(?:[.,][0-9]+)?)/i,
+
+      /THB[^0-9]{0,40}=\s*([0-9]+(?:[.,][0-9]+)?)/i
+    ]);
+
+
+  /*
+  -------------------------------------------------------
+    USD
+  -------------------------------------------------------
+  */
+
+  const usd =
+    firstMatch(text, [
+
+      /1\s*USD\s*=\s*([0-9]+(?:[.,][0-9]+)?)/i,
+
+      /USD[^0-9]{0,40}=\s*([0-9]+(?:[.,][0-9]+)?)/i
+    ]);
+
+
+  /*
+  -------------------------------------------------------
+    IDUBID USD
+  -------------------------------------------------------
+  */
+
+  const usdIdubid =
+    firstMatch(text, [
+
+      /IDUBID[^0-9]{0,100}1\s*USD\s*=\s*([0-9]+(?:[.,][0-9]+)?)/i,
+
+      /IDUBID[^0-9]{0,100}USD[^0-9]{0,30}([0-9]+(?:[.,][0-9]+)?)/i
+    ]);
+
+
+  /*
+  -------------------------------------------------------
+    JPY → RUB за 1 JPY
+  -------------------------------------------------------
+
+    Telegram:
+      100 JPY = 56.90
+
+    Калькулятор:
+      1 JPY = 0.569 RUB
+  -------------------------------------------------------
+  */
+
+  const jpyPerOne =
+    jpy
+      ? jpy / 100
+      : 0;
+
+
+  /*
+  -------------------------------------------------------
+    KRW → RUB за 1 KRW
+  -------------------------------------------------------
+  */
+
+  const krwPerOne =
+    krw
+      ? krw / 1000
+      : 0;
+
+
+  /*
+  -------------------------------------------------------
+    Результат
+  -------------------------------------------------------
+  */
 
   const rates = {
-    JPY_INTERNAL: firstMatch(text, [
-      /ЯПОНИЯ[^0-9]{0,80}(?:100\s*JPY|JPY)[^0-9]{0,20}=\s*([0-9]+(?:[.,][0-9]+)?)/i,
-      /100\s*JPY\s*=\s*([0-9]+(?:[.,][0-9]+)?)/i
-    ]),
-    JPY_SWIFT: firstMatch(text, [
-      /ЯПОНИЯ[^0-9]{0,120}SWIFT[^0-9]{0,50}(?:100\s*JPY|JPY)[^0-9]{0,20}=\s*([0-9]+(?:[.,][0-9]+)?)/i,
-      /SWIFT[^0-9]{0,50}100\s*JPY\s*=\s*([0-9]+(?:[.,][0-9]+)?)/i
-    ]),
-    JPY_CASH: firstMatch(text, [
-      /AFA\s*TRADING[^0-9]{0,100}(?:наличные|cash)[^0-9]{0,80}(?:100\s*JPY|JPY)[^0-9]{0,20}=\s*([0-9]+(?:[.,][0-9]+)?)/i,
-      /наличные[^0-9]{0,60}100\s*JPY\s*=\s*([0-9]+(?:[.,][0-9]+)?)/i
-    ]),
-    JPY_QR: firstMatch(text, [
-      /AFA\s*TRADING[^0-9]{0,100}(?:QR|QR-code|QR.code)[^0-9]{0,80}(?:100\s*JPY|JPY)[^0-9]{0,20}=\s*([0-9]+(?:[.,][0-9]+)?)/i,
-      /QR[^0-9]{0,60}100\s*JPY\s*=\s*([0-9]+(?:[.,][0-9]+)?)/i
-    ]),
-    KRW: firstMatch(text, [
-      /(?:ЮЖНАЯ\s*КОРЕЯ|KOREA)[^0-9]{0,80}1000\s*KRW\s*=\s*([0-9]+(?:[.,][0-9]+)?)/i,
-      /1000\s*KRW\s*=\s*([0-9]+(?:[.,][0-9]+)?)/i
-    ]),
-    AED: firstMatch(text, [
-      /(?:ОАЭ|UAE)[^0-9]{0,80}1\s*AED\s*=\s*([0-9]+(?:[.,][0-9]+)?)/i,
-      /1\s*AED\s*=\s*([0-9]+(?:[.,][0-9]+)?)/i
-    ]),
-    USD_SWIFT: firstMatch(text, [
-      /SWIFT[^0-9]{0,80}1\s*USD\s*=\s*([0-9]+(?:[.,][0-9]+)?)/i,
-      /1\s*USD\s*=\s*([0-9]+(?:[.,][0-9]+)?)/i
-    ]),
-    CNY: firstMatch(text, [
-      /(?:КИТАЙ|CHINA)[^0-9]{0,80}1\s*(?:CNY|RMB)\s*=\s*([0-9]+(?:[.,][0-9]+)?)/i,
-      /1\s*(?:CNY|RMB)\s*=\s*([0-9]+(?:[.,][0-9]+)?)/i
-    ]),
-    THB: firstMatch(text, [
-      /(?:ТАИЛАНД|THAILAND)[^0-9]{0,80}1\s*THB\s*=\s*([0-9]+(?:[.,][0-9]+)?)/i,
-      /1\s*THB\s*=\s*([0-9]+(?:[.,][0-9]+)?)/i
-    ]),
-    USD_IDUBID: firstMatch(text, [
-      /IDUBID[^0-9]{0,80}1\s*USD\s*=\s*([0-9]+(?:[.,][0-9]+)?)/i
-    ])
+
+    JPY_INTERNAL:
+      jpyPerOne,
+
+    JPY_SWIFT:
+      jpyPerOne,
+
+    JPY_CASH:
+      jpyPerOne,
+
+    JPY_QR:
+      jpyPerOne,
+
+    KRW:
+      krwPerOne,
+
+    CNY:
+      cny,
+
+    AED:
+      aed,
+
+    THB:
+      thb,
+
+    USD_SWIFT:
+      usd,
+
+    USD_IDUBID:
+      usdIdubid || usd
   };
 
-  // The calculator stores JPY as RUB per 1 JPY and KRW as RUB per 1 KRW.
-  const normalized = {
-    JPY_INTERNAL: rates.JPY_INTERNAL ? rates.JPY_INTERNAL / 100 : 0,
-    JPY_SWIFT: rates.JPY_SWIFT ? rates.JPY_SWIFT / 100 : 0,
-    JPY_CASH: rates.JPY_CASH ? rates.JPY_CASH / 100 : 0,
-    JPY_QR: rates.JPY_QR ? rates.JPY_QR / 100 : 0,
-    KRW: rates.KRW ? rates.KRW / 1000 : 0,
-    CNY: rates.CNY,
-    AED: rates.AED,
-    THB: rates.THB,
-    USD_SWIFT: rates.USD_SWIFT,
-    USD_IDUBID: rates.USD_IDUBID
+
+  /*
+  -------------------------------------------------------
+    Проверяем обязательные значения
+  -------------------------------------------------------
+  */
+
+  const required = [
+    "JPY_SWIFT",
+    "CNY",
+    "KRW",
+    "AED",
+    "THB",
+    "USD_SWIFT"
+  ];
+
+
+  const missing =
+    required.filter(
+      key => !rates[key]
+    );
+
+
+  return {
+    rates,
+    missing,
+    rawText: text
   };
-
-  const required = ['JPY_SWIFT', 'CNY', 'KRW', 'AED', 'THB', 'USD_SWIFT'];
-  const missing = required.filter((key) => !normalized[key]);
-
-  return { rates: normalized, missing, rawText: text };
 }
 
-async function ocrImage(imageUrl) {
-  const apiKey = process.env.OCR_API_KEY;
-  if (!apiKey) {
-    throw new Error('OCR_API_KEY is not configured in Vercel Environment Variables.');
+
+/*
+=========================================================
+  СКАЧИВАНИЕ КАРТИНКИ TELEGRAM
+=========================================================
+*/
+
+async function downloadImage(url) {
+
+  const response =
+    await fetch(url, {
+
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0"
+      },
+
+      cache: "no-store"
+    });
+
+
+  if (!response.ok) {
+
+    throw new Error(
+      `Ошибка загрузки изображения Telegram: HTTP ${response.status}`
+    );
   }
 
-  const url = new URL(OCR_ENDPOINT);
-  url.searchParams.set('apikey', apiKey);
-  url.searchParams.set('url', imageUrl);
-  url.searchParams.set('language', 'rus');
-  url.searchParams.set('isOverlayRequired', 'false');
-  url.searchParams.set('detectOrientation', 'true');
-  url.searchParams.set('scale', 'true');
-  url.searchParams.set('OCREngine', '2');
 
-  const response = await fetch(url, {
-    method: 'GET',
-    headers: { 'Accept': 'application/json' },
-    cache: 'no-store'
-  });
+  const arrayBuffer =
+    await response.arrayBuffer();
 
-  if (!response.ok) throw new Error(`OCR service returned HTTP ${response.status}`);
 
-  const data = await response.json();
-  if (data.IsErroredOnProcessing) {
-    throw new Error((data.ErrorMessage || ['OCR processing failed']).join('; '));
-  }
-
-  const parsed = (data.ParsedResults || []).map((item) => item.ParsedText || '').join('\n');
-  if (!parsed.trim()) throw new Error('OCR returned empty text.');
-  return parsed;
+  return Buffer.from(
+    arrayBuffer
+  );
 }
 
-module.exports = async function handler(req, res) {
+
+/*
+=========================================================
+  OCR
+=========================================================
+*/
+
+async function ocrImage(imageBuffer) {
+
+  console.log(
+    "Запускаем локальный OCR..."
+  );
+
+
+  /*
+    Создаём worker.
+
+    Язык:
+      rus + eng
+
+    Нам нужны одновременно
+    русские названия и валюты:
+      USD
+      JPY
+      KRW
+      CNY
+      AED
+      THB
+  */
+
+  const worker =
+    await createWorker(
+      "rus+eng"
+    );
+
+
   try {
-    const latest = await getLatestImage();
-    const rawText = await ocrImage(latest.imageUrl);
-    const parsed = parseRates(rawText);
 
-    if (parsed.missing.length) {
-      console.error('OCR text:', rawText);
-      throw new Error(`Не удалось распознать курсы: ${parsed.missing.join(', ')}`);
+    const result =
+      await worker.recognize(
+        imageBuffer
+      );
+
+
+    const text =
+      result?.data?.text || "";
+
+
+    if (!text.trim()) {
+
+      throw new Error(
+        "OCR не распознал текст на изображении."
+      );
     }
 
-    res.setHeader('Content-Type', 'application/json; charset=utf-8');
-    res.setHeader('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=300');
-    res.status(200).json({
-      success: true,
-      source: 'Telegram @LoyaltySwift',
-      postId: latest.postId,
-      postUrl: latest.postUrl,
-      imageUrl: latest.imageUrl,
-      updatedAt: new Date().toISOString(),
-      rates: parsed.rates
-    });
-  } catch (error) {
-    console.error(error);
-    res.setHeader('Cache-Control', 'no-store');
-    res.status(502).json({
-      success: false,
-      error: error instanceof Error ? error.message : 'Rates parser failed'
-    });
+
+    console.log(
+      "OCR результат:",
+      text
+    );
+
+
+    return text;
+
+  } finally {
+
+    await worker.terminate();
   }
-};
+}
+
+
+/*
+=========================================================
+  ПОЛУЧЕНИЕ КУРСОВ
+=========================================================
+*/
+
+async function getRates() {
+
+
+  /*
+  -------------------------------------------------------
+    Если кэш ещё актуален,
+    не обращаемся к Telegram.
+  -------------------------------------------------------
+  */
+
+  if (
+    cache.rates &&
+    Date.now() < cache.expiresAt
+  ) {
+
+    return {
+      success: true,
+
+      source:
+        "Telegram @LoyaltySwift",
+
+      cached: true,
+
+      postId:
+        cache.postId,
+
+      postUrl:
+        cache.postUrl,
+
+      imageUrl:
+        cache.imageUrl,
+
+      updatedAt:
+        cache.updatedAt,
+
+      rates:
+        cache.rates
+    };
+  }
+
+
+  /*
+  -------------------------------------------------------
+    Получаем последнюю картинку.
+  -------------------------------------------------------
+  */
+
+  const latest =
+    await getLatestImage();
+
+
+  /*
+  -------------------------------------------------------
+    Если это тот же пост,
+    не делаем OCR повторно.
+  -------------------------------------------------------
+  */
+
+  if (
+    cache.rates &&
+    cache.postId === latest.postId
+  ) {
+
+    cache.expiresAt =
+      Date.now() + CACHE_TIME;
+
+
+    return {
+
+      success: true,
+
+      source:
+        "Telegram @LoyaltySwift",
+
+      cached: true,
+
+      postId:
+        cache.postId,
+
+      postUrl:
+        cache.postUrl,
+
+      imageUrl:
+        cache.imageUrl,
+
+      updatedAt:
+        cache.updatedAt,
+
+      rates:
+        cache.rates
+    };
+  }
+
+
+  /*
+  -------------------------------------------------------
+    Новый пост.
+    Скачиваем новую картинку.
+  -------------------------------------------------------
+  */
+
+  const image =
+    await downloadImage(
+      latest.imageUrl
+    );
+
+
+  /*
+  -------------------------------------------------------
+    OCR
+  -------------------------------------------------------
+  */
+
+  const rawText =
+    await ocrImage(image);
+
+
+  /*
+  -------------------------------------------------------
+    Парсим курсы.
+  -------------------------------------------------------
+  */
+
+  const parsed =
+    parseRates(rawText);
+
+
+  /*
+  -------------------------------------------------------
+    Если не смогли найти
+    необходимые курсы —
+    НЕ уничтожаем старый кэш.
+  -------------------------------------------------------
+  */
+
+  if (
+    parsed.missing.length
+  ) {
+
+    console.error(
+      "Не распознаны:",
+      parsed.missing
+    );
+
+    console.error(
+      "OCR TEXT:",
+      rawText
+    );
+
+
+    /*
+      Если старые курсы есть,
+      продолжаем работать на них.
+    */
+
+    if (cache.rates) {
+
+      return {
+
+        success: true,
+
+        source:
+          "Telegram @LoyaltySwift",
+
+        cached: true,
+
+        ocrError: true,
+
+        warning:
+          "Новый курс не удалось распознать. Используются последние корректные значения.",
+
+        postId:
+          cache.postId,
+
+        postUrl:
+          cache.postUrl,
+
+        imageUrl:
+          cache.imageUrl,
+
+        updatedAt:
+          cache.updatedAt,
+
+        rates:
+          cache.rates
+      };
+    }
+
+
+    throw new Error(
+      "Не удалось распознать необходимые курсы: " +
+      parsed.missing.join(", ")
+    );
+  }
+
+
+  /*
+  -------------------------------------------------------
+    Сохраняем новый кэш.
+  -------------------------------------------------------
+  */
+
+  cache = {
+
+    postId:
+      latest.postId,
+
+    imageUrl:
+      latest.imageUrl,
+
+    postUrl:
+      latest.postUrl,
+
+    rates:
+      parsed.rates,
+
+    rawText:
+      rawText,
+
+    updatedAt:
+      new Date().toISOString(),
+
+    expiresAt:
+      Date.now() + CACHE_TIME
+  };
+
+
+  return {
+
+    success: true,
+
+    source:
+      "Telegram @LoyaltySwift",
+
+    cached: false,
+
+    postId:
+      latest.postId,
+
+    postUrl:
+      latest.postUrl,
+
+    imageUrl:
+      latest.imageUrl,
+
+    updatedAt:
+      cache.updatedAt,
+
+    rates:
+      cache.rates
+  };
+}
+
+
+/*
+=========================================================
+  RENDER HANDLER
+=========================================================
+*/
+
+module.exports =
+  async function handler(
+    req,
+    res
+  ) {
+
+    try {
+
+      const result =
+        await getRates();
+
+
+      res.setHeader(
+        "Content-Type",
+        "application/json; charset=utf-8"
+      );
+
+
+      /*
+        Кэш браузера/прокси —
+        60 секунд.
+      */
+
+      res.setHeader(
+        "Cache-Control",
+        "public, max-age=60, stale-while-revalidate=300"
+      );
+
+
+      res.status(200
