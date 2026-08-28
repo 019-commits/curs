@@ -3,22 +3,21 @@ const { createWorker } = require("tesseract.js");
 const sharp = require("sharp");
 
 let workerPromise = null;
+
 let cachedResult = null;
 let cachedPostId = null;
 
 
-/*
-|--------------------------------------------------------------------------
-| Tesseract
-|--------------------------------------------------------------------------
-*/
+/* ============================================================
+   TESSERACT
+============================================================ */
 
 async function getWorker() {
   if (!workerPromise) {
     console.log("Запускаю Tesseract...");
 
     workerPromise = createWorker(["eng", "rus"], 1, {
-      logger: function (message) {
+      logger: (message) => {
         if (message.status === "recognizing text") {
           console.log(
             `OCR: ${Math.round((message.progress || 0) * 100)}%`
@@ -32,11 +31,9 @@ async function getWorker() {
 }
 
 
-/*
-|--------------------------------------------------------------------------
-| Скачать изображение
-|--------------------------------------------------------------------------
-*/
+/* ============================================================
+   DOWNLOAD IMAGE
+============================================================ */
 
 async function downloadImage(url) {
   const response = await fetch(url, {
@@ -48,7 +45,7 @@ async function downloadImage(url) {
 
   if (!response.ok) {
     throw new Error(
-      `Ошибка загрузки картинки: HTTP ${response.status}`
+      `Не удалось скачать изображение: HTTP ${response.status}`
     );
   }
 
@@ -56,105 +53,57 @@ async function downloadImage(url) {
 }
 
 
-/*
-|--------------------------------------------------------------------------
-| Безопасный crop
-|--------------------------------------------------------------------------
-*/
+/* ============================================================
+   CLEAN OCR TEXT
+============================================================ */
 
-async function recognizeCrop(worker, image, crop, name) {
-  const metadata = await sharp(image).metadata();
-
-  const imageWidth = metadata.width;
-  const imageHeight = metadata.height;
-
-  if (!imageWidth || !imageHeight) {
-    throw new Error("Не удалось определить размер изображения.");
-  }
-
-  /*
-   * Не позволяем crop выйти за границы картинки.
-   */
-
-  const left = Math.max(
-    0,
-    Math.min(crop.left, imageWidth - 1)
-  );
-
-  const top = Math.max(
-    0,
-    Math.min(crop.top, imageHeight - 1)
-  );
-
-  const width = Math.min(
-    crop.width,
-    imageWidth - left
-  );
-
-  const height = Math.min(
-    crop.height,
-    imageHeight - top
-  );
-
-  if (width <= 0 || height <= 0) {
-    throw new Error(
-      `Неверная область ${name}: ${left},${top},${width},${height}`
-    );
-  }
-
-  console.log(
-    `Crop ${name}: ${left}, ${top}, ${width}, ${height}`
-  );
-
-  const cropped = await sharp(image)
-    .extract({
-      left: Math.round(left),
-      top: Math.round(top),
-      width: Math.round(width),
-      height: Math.round(height)
-    })
-    .resize({
-      width: Math.round(width * 2)
-    })
-    .grayscale()
-    .normalize()
-    .png()
-    .toBuffer();
-
-  const result = await worker.recognize(cropped);
-
-  return result?.data?.text || "";
+function cleanText(text) {
+  return String(text || "")
+    .replace(/\r/g, " ")
+    .replace(/\n/g, " ")
+    .replace(/\s+/g, " ")
+    .replace(/,/g, ".")
+    .trim();
 }
 
 
-/*
-|--------------------------------------------------------------------------
-| Число
-|--------------------------------------------------------------------------
-*/
+/* ============================================================
+   EXTRACT NUMBER
+============================================================ */
 
 function number(value) {
   if (!value) {
     return 0;
   }
 
-  const cleaned = String(value)
+  let text = String(value)
     .replace(",", ".")
+    .replace(/O/gi, "0")
     .replace(/[^\d.]/g, "");
 
-  const result = parseFloat(cleaned);
+  /*
+   * Иногда OCR делает:
+   *
+   * 13.45
+   * 13.4S
+   * 13,45
+   */
+
+  const result = parseFloat(text);
 
   return Number.isFinite(result) ? result : 0;
 }
 
 
-/*
-|--------------------------------------------------------------------------
-| Поиск значения
-|--------------------------------------------------------------------------
-*/
+/* ============================================================
+   FIND RATE
+============================================================ */
 
-function find(text, patterns) {
+function findRate(text, patterns) {
+  if (!text) {
+    return 0;
+  }
+
   for (const regex of patterns) {
     const match = text.match(regex);
 
@@ -171,126 +120,298 @@ function find(text, patterns) {
 }
 
 
-/*
-|--------------------------------------------------------------------------
-| Нормализация OCR
-|--------------------------------------------------------------------------
-*/
+/* ============================================================
+   SAFE CROP
+============================================================ */
 
-function cleanText(text) {
-  return String(text || "")
-    .replace(/\r/g, " ")
-    .replace(/\n/g, " ")
-    .replace(/\s+/g, " ")
-    .replace(/,/g, ".")
-    .trim();
+async function recognizeCrop(worker, image, crop, name) {
+  const metadata = await sharp(image).metadata();
+
+  const imageWidth = metadata.width;
+  const imageHeight = metadata.height;
+
+  if (!imageWidth || !imageHeight) {
+    throw new Error("Не удалось определить размер изображения");
+  }
+
+  let left = Math.round(crop.left);
+  let top = Math.round(crop.top);
+  let width = Math.round(crop.width);
+  let height = Math.round(crop.height);
+
+  /*
+   * Защита от выхода за пределы картинки.
+   */
+
+  left = Math.max(0, Math.min(left, imageWidth - 1));
+  top = Math.max(0, Math.min(top, imageHeight - 1));
+
+  width = Math.min(width, imageWidth - left);
+  height = Math.min(height, imageHeight - top);
+
+  if (width <= 2 || height <= 2) {
+    throw new Error(
+      `Crop ${name} слишком маленький: ${width}x${height}`
+    );
+  }
+
+  console.log(
+    `Crop ${name}: ${left}, ${top}, ${width}, ${height}`
+  );
+
+  /*
+   * Увеличиваем область перед OCR.
+   */
+
+  const enlargedWidth = Math.max(
+    900,
+    width * 3
+  );
+
+  const cropped = await sharp(image)
+    .extract({
+      left,
+      top,
+      width,
+      height
+    })
+    .resize({
+      width: enlargedWidth,
+      withoutEnlargement: false
+    })
+    .grayscale()
+    .normalize()
+    .sharpen()
+    .png()
+    .toBuffer();
+
+  const result = await worker.recognize(cropped);
+
+  return result?.data?.text || "";
 }
 
 
-/*
-|--------------------------------------------------------------------------
-| Распознавание
-|--------------------------------------------------------------------------
-*/
+/* ============================================================
+   PARSE RATES
+============================================================ */
 
 async function parseRatesFromImage(image) {
   const worker = await getWorker();
 
   const metadata = await sharp(image).metadata();
 
+  const imageWidth = metadata.width;
+  const imageHeight = metadata.height;
+
+  console.log("");
+  console.log("================================");
   console.log(
-    `Размер изображения: ${metadata.width}x${metadata.height}`
+    `Размер изображения: ${imageWidth}x${imageHeight}`
   );
+  console.log("================================");
 
 
   /*
-   * Реальная картинка:
+   * ==========================================================
+   * БАЗОВОЙ РАЗМЕР ТВОЕЙ КАРТИНКИ
+   * ==========================================================
    *
    * 957 x 1280
    *
-   * Области рассчитаны именно под неё.
+   * Если Telegram отдаст:
+   *
+   * 598 x 800
+   *
+   * координаты автоматически уменьшатся.
    */
 
-  const crops = {
+  const BASE_WIDTH = 957;
+  const BASE_HEIGHT = 1280;
+
+  const scaleX = imageWidth / BASE_WIDTH;
+  const scaleY = imageHeight / BASE_HEIGHT;
+
+
+  /*
+   * ==========================================================
+   * ОБЛАСТИ НА ТВОЕЙ КАРТИНКЕ
+   * ==========================================================
+   */
+
+  const baseCrops = {
+
+    /*
+     * ЮЖНАЯ КОРЕЯ
+     *
+     * 1000 KRW = 65.10
+     */
 
     korea: {
-      left: 50,
-      top: 300,
-      width: 430,
-      height: 140
+      left: 55,
+      top: 310,
+      width: 405,
+      height: 105
     },
+
+
+    /*
+     * ОАЭ
+     *
+     * 1 AED = 23.60
+     */
 
     aed: {
-      left: 540,
-      top: 300,
+      left: 535,
+      top: 310,
       width: 390,
-      height: 140
+      height: 105
     },
+
+
+    /*
+     * ЯПОНИЯ
+     *
+     * внутренний перевод
+     *
+     * 100 JPY = 56.90
+     */
 
     jpyInternal: {
-      left: 50,
-      top: 455,
-      width: 450,
-      height: 145
+      left: 55,
+      top: 475,
+      width: 405,
+      height: 115
     },
+
+
+    /*
+     * SWIFT
+     *
+     * 1 USD = 90.00
+     */
 
     usdSwift: {
-      left: 540,
-      top: 455,
+      left: 535,
+      top: 475,
       width: 390,
-      height: 145
+      height: 115
     },
+
+
+    /*
+     * ЯПОНИЯ SWIFT
+     *
+     * 100 JPY = 56.90
+     */
 
     jpySwift: {
-      left: 50,
-      top: 625,
-      width: 450,
-      height: 145
+      left: 55,
+      top: 645,
+      width: 405,
+      height: 120
     },
+
+
+    /*
+     * КИТАЙ
+     *
+     * 1 CNY = 13.45
+     */
 
     china: {
-      left: 540,
-      top: 625,
+      left: 535,
+      top: 645,
       width: 390,
-      height: 145
+      height: 120
     },
+
+
+    /*
+     * ТАИЛАНД
+     *
+     * 1 THB = 2.74
+     */
 
     thailand: {
-      left: 50,
-      top: 795,
-      width: 450,
-      height: 145
+      left: 55,
+      top: 810,
+      width: 405,
+      height: 125
     },
+
+
+    /*
+     * IDUBID
+     *
+     * 1 USD = 91.50
+     */
 
     idubid: {
-      left: 540,
-      top: 795,
+      left: 535,
+      top: 810,
       width: 390,
+      height: 125
+    },
+
+
+    /*
+     * AFA TRADING
+     *
+     * наличные
+     *
+     * 1 JPY = 57.30
+     */
+
+    afaCash: {
+      left: 55,
+      top: 965,
+      width: 405,
       height: 145
     },
 
-    afaCash: {
-      left: 50,
-      top: 950,
-      width: 450,
-      height: 150
-    },
+
+    /*
+     * AFA TRADING
+     *
+     * QR-code
+     *
+     * 1 JPY = 56.90
+     */
 
     afaQr: {
-      left: 540,
-      top: 950,
+      left: 535,
+      top: 965,
       width: 390,
-      height: 150
+      height: 145
     }
   };
 
 
-  const blocks = {};
+  /*
+   * ==========================================================
+   * МАСШТАБИРОВАНИЕ КООРДИНАТ
+   * ==========================================================
+   */
+
+  const crops = {};
+
+  for (const [name, crop] of Object.entries(baseCrops)) {
+    crops[name] = {
+      left: Math.round(crop.left * scaleX),
+      top: Math.round(crop.top * scaleY),
+      width: Math.round(crop.width * scaleX),
+      height: Math.round(crop.height * scaleY)
+    };
+  }
 
 
   /*
-   * OCR каждого блока.
+   * ==========================================================
+   * OCR БЛОКОВ
+   * ==========================================================
    */
+
+  const blocks = {};
 
   for (const [name, crop] of Object.entries(crops)) {
 
@@ -299,14 +420,14 @@ async function parseRatesFromImage(image) {
 
     try {
 
-      blocks[name] = cleanText(
-        await recognizeCrop(
-          worker,
-          image,
-          crop,
-          name
-        )
+      const text = await recognizeCrop(
+        worker,
+        image,
+        crop,
+        name
       );
+
+      blocks[name] = cleanText(text);
 
       console.log(
         `BLOCK OCR [${name}]: ${blocks[name]}`
@@ -315,7 +436,7 @@ async function parseRatesFromImage(image) {
     } catch (error) {
 
       console.error(
-        `Ошибка OCR блока ${name}:`,
+        `OCR ERROR [${name}]:`,
         error.message
       );
 
@@ -325,141 +446,250 @@ async function parseRatesFromImage(image) {
 
 
   /*
-  |--------------------------------------------------------------------------
-  | KRW
-  |--------------------------------------------------------------------------
-  */
+   * ==========================================================
+   * KRW
+   * ==========================================================
+   *
+   * На картинке:
+   *
+   * 1000 KRW = 65.10
+   */
 
-  const krw = find(blocks.korea, [
+  const krw = findRate(blocks.korea, [
+
     /1000\s*KRW\s*=?\s*([\d.]+)/i,
-    /KRW\s*=?\s*([\d.]+)/i
+
+    /1000\s*K[RЯ]W\s*=?\s*([\d.]+)/i,
+
+    /KRW\s*=?\s*([\d.]+)/i,
+
+    /K[RЯ]W\s*=?\s*([\d.]+)/i
   ]);
 
 
   /*
-  |--------------------------------------------------------------------------
-  | AED
-  |--------------------------------------------------------------------------
-  */
+   * ==========================================================
+   * AED
+   * ==========================================================
+   *
+   * На картинке:
+   *
+   * 1 AED = 23.60
+   */
 
-  const aed = find(blocks.aed, [
+  const aed = findRate(blocks.aed, [
+
     /1\s*AED\s*=?\s*([\d.]+)/i,
+
     /AED\s*=?\s*([\d.]+)/i,
+
+    /1\s*A[ЕE]D\s*=?\s*([\d.]+)/i,
+
     /A[ЕE]D\s*=?\s*([\d.]+)/i,
+
+    /1\s*АЕ[DPР]\s*=?\s*([\d.]+)/i,
+
     /АЕ[DPР]\s*=?\s*([\d.]+)/i
   ]);
 
 
   /*
-  |--------------------------------------------------------------------------
-  | JPY INTERNAL
-  |--------------------------------------------------------------------------
-  */
+   * ==========================================================
+   * JPY INTERNAL
+   * ==========================================================
+   *
+   * На картинке:
+   *
+   * 100 JPY = 56.90
+   */
 
-  const jpyInternal = find(blocks.jpyInternal, [
-    /100\s*JPY\s*=?\s*([\d.]+)/i,
-    /JPY\s*=?\s*([\d.]+)/i
-  ]);
+  const jpyInternal = findRate(
+    blocks.jpyInternal,
+    [
 
+      /100\s*JPY\s*=?\s*([\d.]+)/i,
 
-  /*
-  |--------------------------------------------------------------------------
-  | USD SWIFT
-  |--------------------------------------------------------------------------
-  */
+      /100\s*JP[YV]\s*=?\s*([\d.]+)/i,
 
-  const usdSwift = find(blocks.usdSwift, [
-    /1\s*USD\s*=?\s*([\d.]+)/i,
-    /USD\s*=?\s*([\d.]+)/i,
-
-    /*
-     * Если USD OCR испортил,
-     * ищем число после SWIFT.
-     */
-
-    /SWIFT[\s\S]{0,100}?([\d]{2,3}[.][\d]{2})/i
-  ]);
+      /JPY\s*=?\s*([\d.]+)/i
+    ]
+  );
 
 
   /*
-  |--------------------------------------------------------------------------
-  | JPY SWIFT
-  |--------------------------------------------------------------------------
-  */
+   * ==========================================================
+   * USD SWIFT
+   * ==========================================================
+   *
+   * На картинке:
+   *
+   * 1 USD = 90.00
+   */
 
-  const jpySwift = find(blocks.jpySwift, [
-    /100\s*JPY\s*=?\s*([\d.]+)/i,
-    /JPY\s*=?\s*([\d.]+)/i
-  ]);
+  const usdSwift = findRate(
+    blocks.usdSwift,
+    [
 
+      /1\s*USD\s*=?\s*([\d.]+)/i,
 
-  /*
-  |--------------------------------------------------------------------------
-  | CNY
-  |--------------------------------------------------------------------------
-  */
+      /USD\s*=?\s*([\d.]+)/i,
 
-  const cny = find(blocks.china, [
-    /1\s*CNY\s*=?\s*([\d.]+)/i,
-    /CNY\s*=?\s*([\d.]+)/i,
-    /CN[YV]\s*=?\s*([\d.]+)/i
-  ]);
+      /1\s*US[D0O]\s*=?\s*([\d.]+)/i,
 
+      /*
+       * Запасной вариант:
+       * если SWIFT распознался,
+       * но USD нет.
+       */
 
-  /*
-  |--------------------------------------------------------------------------
-  | THB
-  |--------------------------------------------------------------------------
-  */
-
-  const thb = find(blocks.thailand, [
-    /1\s*THB\s*=?\s*([\d.]+)/i,
-    /THB\s*=?\s*([\d.]+)/i,
-    /T[HН]B\s*=?\s*([\d.]+)/i
-  ]);
+      /SWIFT.{0,80}?(\d{2,3}\.\d{2})/i
+    ]
+  );
 
 
   /*
-  |--------------------------------------------------------------------------
-  | IDUBID USD
-  |--------------------------------------------------------------------------
-  */
+   * ==========================================================
+   * JPY SWIFT
+   * ==========================================================
+   *
+   * На картинке:
+   *
+   * 100 JPY = 56.90
+   */
 
-  const usdIdubid = find(blocks.idubid, [
-    /1\s*USD\s*=?\s*([\d.]+)/i,
-    /USD\s*=?\s*([\d.]+)/i
-  ]);
+  const jpySwift = findRate(
+    blocks.jpySwift,
+    [
 
+      /100\s*JPY\s*=?\s*([\d.]+)/i,
 
-  /*
-  |--------------------------------------------------------------------------
-  | AFA CASH
-  |--------------------------------------------------------------------------
-  */
+      /100\s*JP[YV]\s*=?\s*([\d.]+)/i,
 
-  const jpyCash = find(blocks.afaCash, [
-    /1\s*JPY\s*=?\s*([\d.]+)/i,
-    /JPY\s*=?\s*([\d.]+)/i
-  ]);
-
-
-  /*
-  |--------------------------------------------------------------------------
-  | AFA QR
-  |--------------------------------------------------------------------------
-  */
-
-  const jpyQr = find(blocks.afaQr, [
-    /1\s*JPY\s*=?\s*([\d.]+)/i,
-    /JPY\s*=?\s*([\d.]+)/i
-  ]);
+      /JPY\s*=?\s*([\d.]+)/i
+    ]
+  );
 
 
   /*
-  |--------------------------------------------------------------------------
-  | Логи
-  |--------------------------------------------------------------------------
-  */
+   * ==========================================================
+   * CNY
+   * ==========================================================
+   *
+   * На картинке:
+   *
+   * 1 CNY = 13.45
+   */
+
+  const cny = findRate(
+    blocks.china,
+    [
+
+      /1\s*CNY\s*=?\s*([\d.]+)/i,
+
+      /CNY\s*=?\s*([\d.]+)/i,
+
+      /CN[YV]\s*=?\s*([\d.]+)/i,
+
+      /1\s*CN[YWV]\s*=?\s*([\d.]+)/i
+    ]
+  );
+
+
+  /*
+   * ==========================================================
+   * THB
+   * ==========================================================
+   *
+   * На картинке:
+   *
+   * 1 THB = 2.74
+   */
+
+  const thb = findRate(
+    blocks.thailand,
+    [
+
+      /1\s*THB\s*=?\s*([\d.]+)/i,
+
+      /THB\s*=?\s*([\d.]+)/i,
+
+      /1\s*T[HН]B\s*=?\s*([\d.]+)/i,
+
+      /T[HН]B\s*=?\s*([\d.]+)/i
+    ]
+  );
+
+
+  /*
+   * ==========================================================
+   * USD IDUBID
+   * ==========================================================
+   *
+   * На картинке:
+   *
+   * 1 USD = 91.50
+   */
+
+  const usdIdubid = findRate(
+    blocks.idubid,
+    [
+
+      /1\s*USD\s*=?\s*([\d.]+)/i,
+
+      /USD\s*=?\s*([\d.]+)/i,
+
+      /1\s*US[D0O]\s*=?\s*([\d.]+)/i
+    ]
+  );
+
+
+  /*
+   * ==========================================================
+   * AFA CASH
+   * ==========================================================
+   *
+   * На картинке:
+   *
+   * 1 JPY = 57.30
+   */
+
+  const jpyCash = findRate(
+    blocks.afaCash,
+    [
+
+      /1\s*JPY\s*=?\s*([\d.]+)/i,
+
+      /JPY\s*=?\s*([\d.]+)/i
+    ]
+  );
+
+
+  /*
+   * ==========================================================
+   * AFA QR
+   * ==========================================================
+   *
+   * На картинке:
+   *
+   * 1 JPY = 56.90
+   */
+
+  const jpyQr = findRate(
+    blocks.afaQr,
+    [
+
+      /1\s*JPY\s*=?\s*([\d.]+)/i,
+
+      /JPY\s*=?\s*([\d.]+)/i
+    ]
+  );
+
+
+  /*
+   * ==========================================================
+   * ЛОГ
+   * ==========================================================
+   */
 
   console.log("");
   console.log("================================");
@@ -483,16 +713,28 @@ async function parseRatesFromImage(image) {
 
 
   /*
-  |--------------------------------------------------------------------------
-  | Финальные значения
-  |--------------------------------------------------------------------------
-  */
+   * ==========================================================
+   * ФИНАЛЬНЫЕ ЗНАЧЕНИЯ
+   * ==========================================================
+   *
+   * ВАЖНО:
+   *
+   * На картинке:
+   *
+   * 100 JPY = 56.90
+   *
+   * Поэтому для внутреннего расчёта:
+   *
+   * 1 JPY = 0.569
+   *
+   * Но мы также сохраняем оригинальные
+   * значения JPY выше.
+   */
 
   const rates = {
 
     /*
      * 100 JPY = 56.90
-     * => 1 JPY = 0.569
      */
 
     JPY_INTERNAL:
@@ -500,24 +742,33 @@ async function parseRatesFromImage(image) {
         ? jpyInternal / 100
         : 0,
 
+    /*
+     * 100 JPY = 56.90
+     */
+
     JPY_SWIFT:
       jpySwift
         ? jpySwift / 100
         : 0,
 
     /*
-     * Здесь уже формат:
      * 1 JPY = 57.30
      */
 
     JPY_CASH:
       jpyCash,
 
+    /*
+     * 1 JPY = 56.90
+     */
+
     JPY_QR:
       jpyQr,
 
     /*
      * 1000 KRW = 65.10
+     *
+     * 1 KRW = 0.0651
      */
 
     KRW:
@@ -525,17 +776,37 @@ async function parseRatesFromImage(image) {
         ? krw / 1000
         : 0,
 
+    /*
+     * 1 CNY = 13.45
+     */
+
     CNY:
       cny,
+
+    /*
+     * 1 AED = 23.60
+     */
 
     AED:
       aed,
 
+    /*
+     * 1 THB = 2.74
+     */
+
     THB:
       thb,
 
+    /*
+     * 1 USD = 90.00
+     */
+
     USD_SWIFT:
       usdSwift,
+
+    /*
+     * 1 USD = 91.50
+     */
 
     USD_IDUBID:
       usdIdubid
@@ -549,22 +820,37 @@ async function parseRatesFromImage(image) {
 }
 
 
-/*
-|--------------------------------------------------------------------------
-| API
-|--------------------------------------------------------------------------
-*/
+/* ============================================================
+   API HANDLER
+============================================================ */
 
 async function handler(req, res) {
 
   try {
 
-    const latest =
-      await getLatestImage();
+    /*
+     * Получаем самый свежий пост
+     * из Telegram.
+     */
+
+    const latest = await getLatestImage();
+
+    if (!latest) {
+      throw new Error(
+        "Telegram не вернул новый пост"
+      );
+    }
+
+
+    console.log("");
+    console.log(
+      `Найден Telegram пост: ${latest.postId}`
+    );
 
 
     /*
-     * Уже обрабатывали этот пост.
+     * Если этот пост уже обрабатывали,
+     * не запускаем OCR повторно.
      */
 
     if (
@@ -573,7 +859,9 @@ async function handler(req, res) {
     ) {
 
       return res.json({
+
         success: true,
+
         cached: true,
 
         source:
@@ -597,23 +885,21 @@ async function handler(req, res) {
     }
 
 
-    console.log(
-      `Найден новый Telegram пост: ${latest.postId}`
+    /*
+     * ========================================================
+     * СКАЧИВАЕМ КАРТИНКУ
+     * ========================================================
+     */
+
+    const image = await downloadImage(
+      latest.imageUrl
     );
 
 
     /*
-     * Скачиваем картинку.
-     */
-
-    const image =
-      await downloadImage(
-        latest.imageUrl
-      );
-
-
-    /*
-     * Распознаём.
+     * ========================================================
+     * OCR
+     * ========================================================
      */
 
     const parsed =
@@ -621,13 +907,14 @@ async function handler(req, res) {
         image
       );
 
-
     const rates =
       parsed.rates;
 
 
     /*
-     * Обязательные курсы.
+     * ========================================================
+     * ПРОВЕРЯЕМ ОБЯЗАТЕЛЬНЫЕ КУРСЫ
+     * ========================================================
      */
 
     const required = [
@@ -637,6 +924,8 @@ async function handler(req, res) {
       ["AED", rates.AED],
 
       ["USD_SWIFT", rates.USD_SWIFT],
+
+      ["JPY_INTERNAL", rates.JPY_INTERNAL],
 
       ["JPY_SWIFT", rates.JPY_SWIFT],
 
@@ -654,17 +943,18 @@ async function handler(req, res) {
 
     const missing =
       required
-        .filter(function (item) {
-          return !item[1];
-        })
-        .map(function (item) {
-          return item[0];
-        });
+        .filter(
+          ([name, value]) => !value
+        )
+        .map(
+          ([name]) => name
+        );
 
 
     /*
-     * Если всё найдено —
-     * сохраняем.
+     * ========================================================
+     * ВСЁ РАСПОЗНАНО
+     * ========================================================
      */
 
     if (missing.length === 0) {
@@ -689,6 +979,12 @@ async function handler(req, res) {
         rates:
           rates
       };
+
+
+      console.log("");
+      console.log(
+        "КУРСЫ УСПЕШНО ОБНОВЛЕНЫ"
+      );
 
 
       return res.json({
@@ -719,18 +1015,23 @@ async function handler(req, res) {
 
 
     /*
-     * Не всё распознано.
+     * ========================================================
+     * ЧАСТЬ КУРСОВ НЕ РАСПОЗНАНА
+     * ========================================================
      */
 
-    console.error(
+    console.log("");
+    console.log(
       "НЕ РАСПОЗНАНЫ:",
       missing
     );
 
 
     /*
-     * Если есть старые рабочие данные,
-     * отдаём их.
+     * Если ранее были рабочие курсы,
+     * НЕ ломаем сайт.
+     *
+     * Оставляем предыдущие значения.
      */
 
     if (cachedResult) {
@@ -742,7 +1043,7 @@ async function handler(req, res) {
         cached: true,
 
         warning:
-          "Новый пост найден, но OCR не распознал все курсы. Используются последние рабочие данные.",
+          "Новый пост найден, но OCR не смог распознать все курсы. Используются последние корректные курсы.",
 
         source:
           "Telegram @LoyaltySwift",
@@ -766,7 +1067,9 @@ async function handler(req, res) {
 
 
     /*
-     * Первое распознавание не удалось.
+     * ========================================================
+     * ПЕРВЫЙ ПОСТ И OCR НЕ СПРАВИЛСЯ
+     * ========================================================
      */
 
     return res.status(502).json({
@@ -780,6 +1083,9 @@ async function handler(req, res) {
       postId:
         latest.postId,
 
+      imageUrl:
+        latest.imageUrl,
+
       rates:
         rates,
 
@@ -790,11 +1096,17 @@ async function handler(req, res) {
 
   } catch (error) {
 
+    console.error("");
     console.error(
       "RATES ERROR:",
       error
     );
 
+
+    /*
+     * Если есть старые рабочие данные,
+     * сайт продолжает работать.
+     */
 
     if (cachedResult) {
 
@@ -805,7 +1117,7 @@ async function handler(req, res) {
         cached: true,
 
         warning:
-          "Временная ошибка. Используются последние рабочие курсы.",
+          "Временная ошибка получения нового курса. Используются последние рабочие данные.",
 
         source:
           "Telegram @LoyaltySwift",
@@ -828,16 +1140,24 @@ async function handler(req, res) {
     }
 
 
+    /*
+     * Если рабочих данных ещё нет.
+     */
+
     return res.status(500).json({
 
       success: false,
 
       error:
         error.message ||
-        "Ошибка получения курсов."
+        "Ошибка получения курсов из Telegram."
     });
   }
 }
 
+
+/* ============================================================
+   EXPORT
+============================================================ */
 
 module.exports = handler;
