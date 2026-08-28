@@ -1,12 +1,15 @@
 const cheerio = require("cheerio");
 
 const CHANNEL = "LoyaltySwift";
-const TELEGRAM_PAGE = `https://t.me/s/${CHANNEL}`;
+
+const TELEGRAM_PAGE =
+  `https://t.me/s/${CHANNEL}`;
 
 function extractImageUrl(style) {
-  const match = String(style || "").match(
-    /background-image\s*:\s*url\((['"]?)(.*?)\1\)/i
-  );
+  const match = String(style || "")
+    .match(
+      /background-image\s*:\s*url\((['"]?)(.*?)\1\)/i
+    );
 
   if (!match) {
     return null;
@@ -22,62 +25,77 @@ function extractImageUrl(style) {
 }
 
 async function getLatestImage() {
-  const response = await fetch(TELEGRAM_PAGE, {
-    headers: {
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36",
+  const response = await fetch(
+    TELEGRAM_PAGE,
+    {
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
 
-      "Accept":
-        "text/html,application/xhtml+xml",
+        Accept:
+          "text/html,application/xhtml+xml",
 
-      "Accept-Language":
-        "ru-RU,ru;q=0.9,en;q=0.8"
-    },
+        "Accept-Language":
+          "ru-RU,ru;q=0.9,en;q=0.8"
+      },
 
-    cache: "no-store"
-  });
+      cache: "no-store"
+    }
+  );
 
   if (!response.ok) {
     throw new Error(
-      `Telegram returned HTTP ${response.status}`
+      `Telegram HTTP ${response.status}`
     );
   }
 
-  const html = await response.text();
+  const html =
+    await response.text();
 
-  const $ = cheerio.load(html);
+  const $ =
+    cheerio.load(html);
 
-  const posts = $(".tgme_widget_message");
+  const posts =
+    $(".tgme_widget_message");
 
   if (!posts.length) {
     throw new Error(
-      "Не удалось получить посты Telegram. Проверь, что @LoyaltySwift публичный."
+      "Telegram не вернул публичные посты. Проверь @LoyaltySwift."
     );
   }
 
   /*
-   * Идём от последнего поста к предыдущим.
-   *
-   * Нужен именно последний пост,
-   * содержащий фотографию.
+   * От последнего поста к старым.
    */
 
-  for (let i = posts.length - 1; i >= 0; i--) {
-    const post = posts.eq(i);
+  for (
+    let i = posts.length - 1;
+    i >= 0;
+    i--
+  ) {
+    const post =
+      posts.eq(i);
 
     const dataPost =
-      post.attr("data-post") || "";
+      post.attr("data-post") ||
+      "";
+
+    const parts =
+      dataPost.split("/");
 
     const postId =
-      dataPost.split("/").pop();
+      parts[parts.length - 1];
 
     if (!postId) {
       continue;
     }
 
-    const photo = post
-      .find(".tgme_widget_message_photo_wrap")
-      .first();
+    const photo =
+      post
+        .find(
+          ".tgme_widget_message_photo_wrap"
+        )
+        .first();
 
     if (!photo.length) {
       continue;
@@ -105,7 +123,7 @@ async function getLatestImage() {
   }
 
   throw new Error(
-    "В последних постах Telegram не найдено изображение."
+    "В @LoyaltySwift пока не найдена фотография."
   );
 }
 
